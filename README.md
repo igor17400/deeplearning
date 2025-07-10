@@ -14,6 +14,7 @@ The goal is to provide practical, hands-on examples to solidify the understandin
   - [The Convolution Operation](#the-convolution-operation)
   - [Graph Neural Networks (GNNs)](#graph-neural-networks-gnns)
   - [JAXing Up Your Machine Learning](#jaxing-up-your-machine-learning)
+  - [JAXing Up Your Neural Network Journey](#jaxing-up-your-neural-network-journey)
 - [Contributing](#contributing)
 - [License](#license)
 - [Contact](#contact)
@@ -65,15 +66,15 @@ Here you'll find a curated list of in-depth tutorials.
 
 -   **Blog Post:** [The Convolution Operation](https://igorlrazevedo.substack.com/p/the-convolution-operation)
 -   **Code:**
-    -   `scripts/convolution/1d_convolution.py`
-    -   `scripts/convolution/2d_convolution.py`
+    -  [1d_convolution.py](code/convolution/1d_convolution.py)
+    -  [2d_convolution.py](code/convolution/2d_convolution.py)
 
 ### Graph Neural Networks (GNNs) - Keras Implementation (using Spektral) 
 
 > Graph Neural Networks (GNNs) are a class of deep learning methods designed to perform inference on data described by graphs. This tutorial will guide you through the fundamentals of GNNs and introduce you to `Spektral`, a Python library for building graph neural networks with TensorFlow and Keras.
 
 -   **Blog Post:** [I want to read it!](https://igorlrazevedo.substack.com/p/jaxing-up-your-machine-learning)
--   **Code:** `code/GNN/gnn_spektral_intro.ipynb`
+-   **Code:** [gnn_spektral_intro.ipynb](code/GNN/gnn_spektral_intro.ipynb)
 
 ### JAXing Up Your Machine Learning
 
@@ -81,7 +82,17 @@ Here you'll find a curated list of in-depth tutorials.
 
 
 -   **Blog Post:** [I want to read it!](https://igorlrazevedo.substack.com/p/jaxing-up-your-machine-learning)
--   **Code:** `code/jax/jax_101.ipynb`
+-   **Code:** [jax_101.ipynb](code/jax/jax_101.ipynb)
+
+### JAXing Up Your Neural Network Journey
+
+> So, why are we writing about Flax if the title promises JAX? From their original documentation:
+Flax provides a flexible end-to-end user experience for researchers and developers who use JAX for neural networks. Flax enables you to use the full power of JAX.
+
+
+-   **Blog Post:** [I want to read it!](https://open.substack.com/pub/igorlrazevedo/p/jaxing-up-your-neural-network-journey?r=2qk43q&utm_campaign=post&utm_medium=web&showWelcomeOnShare=true)
+-   **Code:** [flax_101.ipynb](code/jax/flax_101.ipynb)
+
 
 ***
 
