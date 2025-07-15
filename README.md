@@ -15,6 +15,7 @@ The goal is to provide practical, hands-on examples to solidify the understandin
   - [Graph Neural Networks (GNNs)](#graph-neural-networks-gnns)
   - [JAXing Up Your Machine Learning](#jaxing-up-your-machine-learning)
   - [JAXing Up Your Neural Network Journey](#jaxing-up-your-neural-network-journey)
+  - [JAXing Up Your Graphs: GNN Implementation](#jaxing-up-your-graphs-gnn-implementation)
 - [Contributing](#contributing)
 - [License](#license)
 - [Contact](#contact)
@@ -93,6 +94,12 @@ Flax provides a flexible end-to-end user experience for researchers and develope
 -   **Blog Post:** [I want to read it!](https://open.substack.com/pub/igorlrazevedo/p/jaxing-up-your-neural-network-journey?r=2qk43q&utm_campaign=post&utm_medium=web&showWelcomeOnShare=true)
 -   **Code:** [flax_101.ipynb](code/jax/flax_101.ipynb)
 
+### JAXing Up Your Graphs: GNN Implementation
+
+> Let's implement a foundational Graph Neural Network layer based purely on the message passing paradigm. This will be a more general "GNN layer" than a specific GCN, allowing us to understand the core mechanics without the extra complexity of convolutional normalization.
+
+-   **Blog Post:** [I want to read it!](https://open.substack.com/pub/igorlrazevedo/p/jax-gnn?r=2qk43q&utm_campaign=post&utm_medium=web&showWelcomeOnShare=false)
+-   **Code:** [gnns.ipynb](code/jax/gnns.ipynb)
 
 ***
 
