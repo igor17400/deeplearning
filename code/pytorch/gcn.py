@@ -6,6 +6,7 @@ import torch_geometric.nn as geom_nn
 import torch_geometric.data as geom_data
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
+from torchmetrics import F1Score
 
 
 # --- Torch Classes ---
@@ -94,6 +95,7 @@ class NodeLevelClassifier(L.LightningModule):
         else:
             self.model = GNNModel(**model_kwargs)
         self.loss_fn = nn.CrossEntropyLoss()
+        self.f1_score = F1Score(task="multiclass", num_classes=model_kwargs.get("out_channels", 7))
 
     def forward(self, data, mode="train"):
         x, edge_index = data.x, data.edge_index
@@ -111,25 +113,29 @@ class NodeLevelClassifier(L.LightningModule):
 
         loss = self.loss_fn(x[mask], data.y[mask])
         acc = (x[mask].argmax(dim=-1) == data.y[mask]).sum().float() / mask.sum()
-        return loss, acc
+        f1 = self.f1_score(x[mask].argmax(dim=-1), data.y[mask])
+        return loss, acc, f1
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
     def training_step(self, batch, batch_idx):
-        loss, acc = self.forward(batch, mode="train")
+        loss, acc, f1 = self.forward(batch, mode="train")
         self.log("train_loss", loss)
         self.log("train_acc", acc)
+        self.log("train_f1", f1)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        _, acc = self.forward(batch, mode="val")
+        _, acc, f1 = self.forward(batch, mode="val")
         self.log("val_acc", acc)
+        self.log("val_f1", f1)
 
     def test_step(self, batch, batch_idx):
-        _, acc = self.forward(batch, mode="test")
+        _, acc, f1 = self.forward(batch, mode="test")
         self.log("test_acc", acc)
+        self.log("test_f1", f1)
 
 
 def train_node_classifier(model_name, dataset, **model_kwargs):
@@ -165,20 +171,23 @@ def train_node_classifier(model_name, dataset, **model_kwargs):
     test_result = trainer.test(model, node_data_loader, verbose=False)
     batch = next(iter(node_data_loader))
     batch = batch.to(model.device)
-    _, train_acc = model.forward(batch, mode="train")
-    _, val_acc = model.forward(batch, mode="val")
-    result = {"train": train_acc,
-              "val": val_acc,
-              "test": test_result[0]['test_acc']}
+    _, train_acc, train_f1 = model.forward(batch, mode="train")
+    _, val_acc, val_f1 = model.forward(batch, mode="val")
+    result = {"train_acc": train_acc, "train_f1": train_f1,
+              "val_acc": val_acc, "val_f1": val_f1,
+              "test_acc": test_result[0]['test_acc'], "test_f1": test_result[0]['test_f1']}
     return model, result
 
 
 def print_results(result_dict):
-    if "train" in result_dict:
-        print(f"Train accuracy: {(100.0 * result_dict['train']):4.2f}%")
-    if "val" in result_dict:
-        print(f"Val accuracy:   {(100.0 * result_dict['val']):4.2f}%")
-    print(f"Test accuracy:  {(100.0 * result_dict['test']):4.2f}%")
+    if "train_acc" in result_dict:
+        print(f"Train accuracy: {(100.0 * result_dict['train_acc']):4.2f}%")
+        print(f"Train F1:       {(100.0 * result_dict['train_f1']):4.2f}%")
+    if "val_acc" in result_dict:
+        print(f"Val accuracy:   {(100.0 * result_dict['val_acc']):4.2f}%")
+        print(f"Val F1:         {(100.0 * result_dict['val_f1']):4.2f}%")
+    print(f"Test accuracy:  {(100.0 * result_dict['test_acc']):4.2f}%")
+    print(f"Test F1:        {(100.0 * result_dict['test_f1']):4.2f}%")
 
 
 # --- Model Instantiate ---
