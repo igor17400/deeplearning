@@ -7,6 +7,7 @@ import scipy.sparse as sp  # Useful for handling sparse adjacency matrices
 from typing import Sequence
 import optax
 import matplotlib.pyplot as plt
+import torch_geometric
 
 
 # -- Data --
@@ -186,6 +187,36 @@ def preprocess_adjacency_matrix(adj):
     return A_hat
 
 
+# -- MLP --
+class MLP(nnx.Module):
+    def __init__(self, in_features, hidden_features, out_features, dropout_rate=0.1, *, rngs: nnx.Rngs):
+        self.layers = []
+        current_features = in_features
+
+        # Add hidden layers with Linear + ReLU + Dropout
+        for hidden_dim in hidden_features:
+            self.layers.extend([
+                nnx.Linear(current_features, hidden_dim, rngs=rngs),
+                nnx.relu,
+                nnx.Dropout(rate=dropout_rate, rngs=rngs)
+            ])
+            current_features = hidden_dim
+
+        # Final output layer (no activation, no dropout)
+        self.layers.append(nnx.Linear(current_features, out_features, rngs=rngs))
+
+    def __call__(self, x, *, rngs: nnx.Rngs):
+        for layer in self.layers:
+            if callable(layer):
+                if hasattr(layer, '__call__') and 'rngs' in layer.__call__.__code__.co_varnames:
+                    # For layers that need rngs (Linear, Dropout)
+                    x = layer(x, rngs=rngs)
+                else:
+                    # For activation functions (relu)
+                    x = layer(x)
+        return x
+
+
 # -- GCN --
 class GCNLayer(nnx.Module):
     def __init__(
@@ -316,12 +347,20 @@ def categorical_loss(logits, labels, mask):
     return jnp.sum(masked_loss) / jnp.sum(mask)
 
 
-def loss_fn(model: GCN, batch, rngs: nnx.Rngs):
-    logits = model(
-        batch["adj"],
-        batch["features"],
-        rngs=rngs
-    )
+def loss_fn(model, batch, rngs: nnx.Rngs):
+    """Generic loss function that works with both GCN and MLP models."""
+    # Check if model is GCN (needs adjacency matrix) or MLP (only features)
+    if hasattr(model, 'gcn_layers') or isinstance(model, GCN):
+        # GCN model - pass adjacency matrix
+        logits = model(
+            batch["adj"],
+            batch["features"],
+            rngs=rngs
+        )
+    else:
+        # MLP model - only pass features
+        logits = model(batch["features"], rngs=rngs)
+
     loss = categorical_loss(
         logits,
         batch["label"],
@@ -332,7 +371,7 @@ def loss_fn(model: GCN, batch, rngs: nnx.Rngs):
 
 @nnx.jit
 def train_step(
-        model: GCN,
+        model,
         optimizer,
         metrics: nnx.MultiMetric,
         batch,
@@ -349,13 +388,14 @@ def train_step(
         loss=loss,
         logits=logits,
         labels=jnp.argmax(batch["label"], axis=1),
+        mask=batch["mask"],
     )
     optimizer.update(grads)  # In-place updates
 
 
 @nnx.jit
 def eval_step(
-        model: GCN,
+        model,
         metrics: nnx.MultiMetric,
         batch,
         rngs: nnx.Rngs
@@ -363,11 +403,12 @@ def eval_step(
     # In evaluation mode, dropout is automatically disabled by NNX
     # when no training is happening (deterministic behavior)
     loss, logits = loss_fn(model, batch, rngs)
-    
+
     metrics.update(
         loss=loss,
         logits=logits,
         labels=jnp.argmax(batch["label"], axis=1),
+        mask=batch["mask"],
     )
 
 
@@ -389,16 +430,239 @@ def create_dataset_iterator(batch, num_repeats=1):
         yield batch
 
 
+# --- Custom Metrics ---
+class MaskedAccuracy(nnx.metrics.Average):
+    """Accuracy metric that respects node masks for graph node classification."""
+
+    def __init__(self):
+        super().__init__()
+
+    def update(self, *, logits, labels, mask=None, **kwargs):
+        predictions = jnp.argmax(logits, axis=-1)
+        correct_predictions = (predictions == labels).astype(jnp.float32)
+
+        if mask is not None:
+            # Only count predictions for masked nodes
+            masked_correct = jnp.where(mask, correct_predictions, 0.0)
+            masked_total = jnp.where(mask, 1.0, 0.0)
+            # Update with the average accuracy for this batch
+            batch_accuracy = jnp.sum(masked_correct) / (jnp.sum(masked_total) + 1e-8)
+        else:
+            batch_accuracy = jnp.mean(correct_predictions)
+
+        super().update(values=batch_accuracy)
+
+
+class F1Score(nnx.metrics.Average):
+    """Macro-averaged F1 score for multi-class classification."""
+
+    def __init__(self, num_classes):
+        super().__init__()
+        self.num_classes = num_classes
+
+    def update(self, *, logits, labels, **kwargs):
+        predictions = jnp.argmax(logits, axis=-1)
+
+        # Calculate F1 per class
+        f1_scores = []
+        for class_idx in range(self.num_classes):
+            pred_class = (predictions == class_idx)
+            true_class = (labels == class_idx)
+
+            tp = jnp.sum(pred_class & true_class)
+            fp = jnp.sum(pred_class & ~true_class)
+            fn = jnp.sum(~pred_class & true_class)
+
+            precision = tp / (tp + fp + 1e-8)
+            recall = tp / (tp + fn + 1e-8)
+            f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+            f1_scores.append(f1)
+
+        # Compute macro-averaged F1
+        macro_f1 = jnp.mean(jnp.array(f1_scores))
+        super().update(values=macro_f1)
+
+
+def train_model(model, train_batch, val_batch, test_batch,
+                learning_rate=0.01, epochs=200, eval_every=20,
+                model_name="Model"):
+    """
+    Generic training function that works with both GCN and MLP models.
+    
+    Args:
+        model: The model to train (GCN or MLP)
+        train_batch: Training data batch
+        val_batch: Validation data batch  
+        test_batch: Test data batch
+        learning_rate: Learning rate for optimizer
+        epochs: Number of training epochs
+        eval_every: Evaluate every N steps
+        model_name: Name for logging purposes
+        
+    Returns:
+        dict: Training history and final results
+    """
+    # Initialize optimizer
+    optimizer = nnx.Optimizer(model, optax.adam(learning_rate))
+
+    # Initialize metrics
+    num_classes = train_batch['label'].shape[1]
+    metrics = nnx.MultiMetric(
+        accuracy=nnx.metrics.Accuracy(),
+        masked_accuracy=MaskedAccuracy(),
+        f1_score=F1Score(num_classes=num_classes),
+        loss=nnx.metrics.Average('loss'),
+    )
+
+    # Training history
+    metrics_history = {
+        'train_loss': [],
+        'train_accuracy': [],
+        'train_masked_accuracy': [],
+        'train_f1_score': [],
+        'val_loss': [],
+        'val_accuracy': [],
+        'val_masked_accuracy': [],
+        'val_f1_score': [],
+    }
+
+    # Best model tracking
+    best_val_acc = 0.0
+    best_model_state = None
+
+    # Initialize RNG
+    rng = nnx.Rngs(42)
+
+    print(f"\n=== Training {model_name} ===\n")
+
+    # Training loop
+    for step in range(epochs):
+        # Training step
+        train_step(model, optimizer, metrics, train_batch, rng)
+
+        # Evaluation
+        if step > 0 and (step % eval_every == 0 or step == epochs - 1):
+            # Compute training metrics
+            for metric, value in metrics.compute().items():
+                metrics_history[f'train_{metric}'].append(value)
+            metrics.reset()
+
+            # Compute validation metrics
+            eval_step(model, metrics, val_batch, rng)
+            for metric, value in metrics.compute().items():
+                metrics_history[f'val_{metric}'].append(value)
+            metrics.reset()
+
+            # Track best model
+            current_val_acc = metrics_history['val_accuracy'][-1]
+            if current_val_acc > best_val_acc:
+                best_val_acc = current_val_acc
+                best_model_state = nnx.state(model)
+                print(f"New best validation accuracy: {best_val_acc:.4f}")
+
+            # Log progress
+            print(f"Step {step}: Train Loss: {metrics_history['train_loss'][-1]:.4f}, "
+                  f"Train Acc: {metrics_history['train_accuracy'][-1]:.4f}, "
+                  f"Train Masked Acc: {metrics_history['train_masked_accuracy'][-1]:.4f}")
+            print(f"          Val Loss: {metrics_history['val_loss'][-1]:.4f}, "
+                  f"Val Acc: {metrics_history['val_accuracy'][-1]:.4f}, "
+                  f"Val Masked Acc: {metrics_history['val_masked_accuracy'][-1]:.4f}")
+
+    # Final test evaluation with best model
+    if best_model_state is not None:
+        nnx.update(model, best_model_state)
+
+    test_metrics = nnx.MultiMetric(
+        accuracy=nnx.metrics.Accuracy(),
+        masked_accuracy=MaskedAccuracy(),
+        f1_score=F1Score(num_classes=num_classes),
+        loss=nnx.metrics.Average('loss'),
+    )
+
+    eval_step(model, test_metrics, test_batch, rng)
+    final_test_results = test_metrics.compute()
+
+    print(f"\n=== {model_name} Final Results ===\n")
+    print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+    print(f"Final Test Accuracy: {final_test_results['accuracy']:.4f}")
+    print(f"Final Test Masked Accuracy: {final_test_results['masked_accuracy']:.4f}")
+    print(f"Final Test F1 Score: {final_test_results['f1_score']:.4f}")
+
+    return {
+        'metrics_history': metrics_history,
+        'final_test_results': final_test_results,
+        'best_val_acc': best_val_acc,
+        'model_state': best_model_state
+    }
+
+
 # --- Model & Hyperparameters ---
 LEARNING_RATE = 0.01
 EPOCHS = 200
 HIDDEN_FEATURES = [16, 16]
 DROPOUT_RATE = 0.2
 
+# --- Data Source Configuration ---
+DATA_TO_CHOOSE = "original"  # "preprocess" for custom preprocessing, "original" for PyTorch Geometric
+
+def load_data(data_source="original"):
+    """
+    Load Cora dataset from specified source.
+    
+    Args:
+        data_source (str): "preprocess" for custom preprocessing, "original" for PyTorch Geometric
+        
+    Returns:
+        tuple: (adj_normalized, features, labels, train_mask, val_mask, test_mask)
+    """
+    if data_source == "preprocess":
+        print("Loading data using custom preprocessing...")
+        # Load using custom preprocessing
+        adj_raw, features, labels, train_mask, val_mask, test_mask = load_cora()
+        adj_normalized = preprocess_adjacency_matrix(adj_raw)
+        
+        print(f"Custom preprocessing - Features shape: {features.shape}")
+        print(f"Custom preprocessing - Labels shape: {labels.shape}")
+        print(f"Custom preprocessing - Adjacency shape: {adj_normalized.shape}")
+        
+    elif data_source == "original":
+        print("Loading data using PyTorch Geometric...")
+        # Load using PyTorch Geometric
+        cora_dataset = torch_geometric.datasets.Planetoid(root="./dataset", name="Cora")
+        data = cora_dataset[0]
+        
+        # Convert PyTorch tensors to JAX arrays
+        edge_index = jnp.array(data.edge_index.numpy())
+        features = jnp.array(data.x.numpy())
+        labels_int = jnp.array(data.y.numpy())
+        train_mask = jnp.array(data.train_mask.numpy())
+        val_mask = jnp.array(data.val_mask.numpy())
+        test_mask = jnp.array(data.test_mask.numpy())
+        
+        # Convert edge_index to adjacency matrix
+        num_nodes = features.shape[0]
+        adj_raw = jnp.zeros((num_nodes, num_nodes))
+        adj_raw = adj_raw.at[edge_index[0], edge_index[1]].set(1.0)
+        adj_raw = adj_raw.at[edge_index[1], edge_index[0]].set(1.0)  # Make symmetric
+        
+        # Convert integer labels to one-hot
+        num_classes = jnp.max(labels_int) + 1
+        labels = jnp.eye(num_classes)[labels_int]
+        
+        # Process adjacency matrix (add self-loops and normalize)
+        adj_normalized = preprocess_adjacency_matrix(adj_raw)
+        
+        print(f"PyTorch Geometric - Features shape: {features.shape}")
+        print(f"PyTorch Geometric - Labels shape: {labels.shape}")
+        print(f"PyTorch Geometric - Adjacency shape: {adj_normalized.shape}")
+        
+    else:
+        raise ValueError(f"Invalid data_source: {data_source}. Must be 'preprocess' or 'original'")
+    
+    return adj_normalized, features, labels, train_mask, val_mask, test_mask
+
 # --- Load Data ---
-adj_raw, features, labels, train_mask, val_mask, test_mask = load_cora()
-# Create the correctly processed adjacency matrix
-adj_normalized = preprocess_adjacency_matrix(adj_raw)
+adj_normalized, features, labels, train_mask, val_mask, test_mask = load_data(DATA_TO_CHOOSE)
 
 # Create train, validation, and test batches
 train_batch = create_batch(adj_normalized, features, labels, train_mask)
@@ -426,107 +690,132 @@ print(f"Train mask sum: {jnp.sum(train_batch['mask'])}")
 print(f"Validation mask sum: {jnp.sum(val_batch['mask'])}")
 print(f"Test mask sum: {jnp.sum(test_batch['mask'])}")
 
-# --- Metrics definition ---
-metrics = nnx.MultiMetric(
-    accuracy=nnx.metrics.Accuracy(),
-    loss=nnx.metrics.Average('loss'),
-)
+# --- Model Comparison: GCN vs MLP ---
 
-# --- Initialize Model and Optimizer ---
-model = GCN(
+# Initialize both models
+gcn_model = GCN(
     input_features=features.shape[1],
     output_features=labels.shape[1],
     hidden_features=HIDDEN_FEATURES,
     dropout_rate=DROPOUT_RATE,
     rngs=nnx.Rngs(0),
 )
-optimizer = nnx.Optimizer(model, optax.adam(LEARNING_RATE))
 
-# --- Training Loop ---
-metrics_history = {
-    'train_loss': [],
-    'train_accuracy': [],
-    'val_loss': [],
-    'val_accuracy': [],
-}
-
-# Best model tracking
-best_val_acc = 0.0
-best_model_state = None
-
-eval_every = 20
-train_steps = EPOCHS
-
-# Initialize RNG for training
-rng = nnx.Rngs(42)
-
-for step in range(train_steps):
-    # Run the optimization for one step and make a stateful update to the following:
-    # - The train state's model parameters
-    # - The optimizer state
-    # - The training loss and accuracy batch metrics
-    train_step(model, optimizer, metrics, train_batch, rng)
-
-    if step > 0 and (step % eval_every == 0 or step == train_steps - 1):  # One training epoch has passed.
-        # Log the training metrics.
-        for metric, value in metrics.compute().items():  # Compute the metrics.
-            metrics_history[f'train_{metric}'].append(value)  # Record the metrics.
-        metrics.reset()  # Reset the metrics for the test set.
-
-        # Compute the metrics on the validation set after each training epoch.
-        eval_step(model, metrics, val_batch, rng)
-
-        # Log the validation metrics.
-        for metric, value in metrics.compute().items():
-            metrics_history[f'val_{metric}'].append(value)
-        metrics.reset()  # Reset the metrics for the next training epoch.
-
-        # Track best model based on validation accuracy
-        current_val_acc = metrics_history['val_accuracy'][-1]
-        if current_val_acc > best_val_acc:
-            best_val_acc = current_val_acc
-            best_model_state = nnx.state(model)  # Save model state
-            print(f"New best validation accuracy: {best_val_acc:.4f}")
-
-        print(f"Step {step}: Train Loss: {metrics_history['train_loss'][-1]:.4f}, "
-              f"Train Acc: {metrics_history['train_accuracy'][-1]:.4f}, "
-              f"Val Loss: {metrics_history['val_loss'][-1]:.4f}, "
-              f"Val Acc: {metrics_history['val_accuracy'][-1]:.4f}")
-
-# --- Final Test Evaluation ---
-print("\n=== Training Complete ===")
-print(f"Best validation accuracy: {best_val_acc:.4f}")
-
-# Load best model for final testing
-if best_model_state is not None:
-    nnx.update(model, best_model_state)
-    print("Loaded best model for final testing")
-
-# Final test evaluation
-print("\n=== Final Test Evaluation ===")
-test_metrics = nnx.MultiMetric(
-    accuracy=nnx.metrics.Accuracy(),
-    loss=nnx.metrics.Average('loss'),
+mlp_model = MLP(
+    in_features=features.shape[1],
+    hidden_features=HIDDEN_FEATURES,
+    out_features=labels.shape[1],
+    dropout_rate=DROPOUT_RATE,
+    rngs=nnx.Rngs(1),
 )
 
-eval_step(model, test_metrics, test_batch, rng)
-final_test_results = test_metrics.compute()
+# Train both models
+print("=" * 60)
+print("COMPARING GCN vs MLP PERFORMANCE")
+print("=" * 60)
 
-print(f"Final Test Loss: {final_test_results['loss']:.4f}")
-print(f"Final Test Accuracy: {final_test_results['accuracy']:.4f}")
+# Train GCN
+gcn_results = train_model(
+    model=gcn_model,
+    train_batch=train_batch,
+    val_batch=val_batch,
+    test_batch=test_batch,
+    learning_rate=LEARNING_RATE,
+    epochs=EPOCHS,
+    eval_every=20,
+    model_name="GCN"
+)
 
-# Plot final training curves
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-ax1.set_title('Loss')
-ax2.set_title('Accuracy')
-for dataset in ('train', 'val'):
-    ax1.plot(metrics_history[f'{dataset}_loss'], label=f'{dataset}_loss')
-    ax2.plot(metrics_history[f'{dataset}_accuracy'], label=f'{dataset}_accuracy')
+# Train MLP  
+mlp_results = train_model(
+    model=mlp_model,
+    train_batch=train_batch,
+    val_batch=val_batch,
+    test_batch=test_batch,
+    learning_rate=LEARNING_RATE,
+    epochs=EPOCHS,
+    eval_every=20,
+    model_name="MLP"
+)
+
+# Performance comparison
+print("\n" + "=" * 60)
+print("FINAL PERFORMANCE COMPARISON")
+print("=" * 60)
+
+
+def print_comparison_table():
+    print(f"{'Metric':<25} {'GCN':<15} {'MLP':<15} {'Difference':<15}")
+    print("-" * 70)
+
+    metrics_to_compare = [
+        ('Test Accuracy', 'accuracy'),
+        ('Test Masked Accuracy', 'masked_accuracy'),
+        ('Test F1 Score', 'f1_score'),
+        ('Test Loss', 'loss'),
+        ('Best Val Accuracy', 'best_val_acc')
+    ]
+
+    for display_name, metric_key in metrics_to_compare:
+        if metric_key == 'best_val_acc':
+            gcn_val = gcn_results[metric_key]
+            mlp_val = mlp_results[metric_key]
+        else:
+            gcn_val = gcn_results['final_test_results'][metric_key]
+            mlp_val = mlp_results['final_test_results'][metric_key]
+
+        diff = gcn_val - mlp_val
+        diff_str = f"+{diff:.4f}" if diff > 0 else f"{diff:.4f}"
+
+        print(f"{display_name:<25} {gcn_val:<15.4f} {mlp_val:<15.4f} {diff_str:<15}")
+
+
+print_comparison_table()
+
+# Plot comparison
+fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+fig.suptitle('GCN vs MLP Training Comparison', fontsize=16)
+
+ax1.set_title('Training Loss')
+ax2.set_title('Validation Accuracy')
+ax3.set_title('Training Masked Accuracy')
+ax4.set_title('Validation F1 Score')
+
+# Plot training curves for both models
+models_data = [
+    ('GCN', gcn_results['metrics_history'], 'blue'),
+    ('MLP', mlp_results['metrics_history'], 'red')
+]
+
+for model_name, history, color in models_data:
+    ax1.plot(history['train_loss'], label=f'{model_name} Train Loss', color=color, linestyle='-')
+    ax2.plot(history['val_accuracy'], label=f'{model_name} Val Accuracy', color=color, linestyle='-')
+    ax3.plot(history['train_masked_accuracy'], label=f'{model_name} Train Masked Acc', color=color, linestyle='-')
+    ax4.plot(history['val_f1_score'], label=f'{model_name} Val F1', color=color, linestyle='-')
+
 ax1.legend()
 ax2.legend()
+ax3.legend()
+ax4.legend()
+
+plt.tight_layout()
 plt.show()
 
 # Summary
-print("\n=== Summary ===")
-print(f"Best Validation Accuracy: {best_val_acc:.4f}")
-print(f"Final Test Accuracy: {final_test_results['accuracy']:.4f}")
+print(f"\n{'=' * 60}")
+print("SUMMARY")
+print(f"{'=' * 60}")
+gcn_test_acc = gcn_results['final_test_results']['accuracy']
+mlp_test_acc = mlp_results['final_test_results']['accuracy']
+
+if gcn_test_acc > mlp_test_acc:
+    winner = "GCN"
+    improvement = gcn_test_acc - mlp_test_acc
+else:
+    winner = "MLP"
+    improvement = mlp_test_acc - gcn_test_acc
+
+print(f"Winner: {winner}")
+print(f"Test Accuracy Improvement: {improvement:.4f} ({improvement * 100:.2f}%)")
+print(f"GCN leverages graph structure: {'✓' if gcn_test_acc > mlp_test_acc else '✗'}")
+print(f"{'=' * 60}")
