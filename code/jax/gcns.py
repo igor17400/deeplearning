@@ -664,11 +664,6 @@ def load_data(data_source="original"):
 # --- Load Data ---
 adj_normalized, features, labels, train_mask, val_mask, test_mask = load_data(DATA_TO_CHOOSE)
 
-# Create train, validation, and test batches
-train_batch = create_batch(adj_normalized, features, labels, train_mask)
-val_batch = create_batch(adj_normalized, features, labels, val_mask)
-test_batch = create_batch(adj_normalized, features, labels, test_mask)
-
 # Print dataset information
 print(f"\nDataset splits:")
 print(f"Training nodes: {jnp.sum(train_mask)}")
@@ -676,10 +671,10 @@ print(f"Validation nodes: {jnp.sum(val_mask)}")
 print(f"Test nodes: {jnp.sum(test_mask)}")
 print(f"Total nodes: {len(features)}")
 
-# Create dataset iterators
-train_ds = create_dataset_iterator(train_batch, EPOCHS)
-val_ds = create_dataset_iterator(val_batch, 1)  # For evaluation
-test_ds = create_dataset_iterator(test_batch, 1)  # For final evaluation
+# Create train, validation, and test batches
+train_batch = create_batch(adj_normalized, features, labels, train_mask)
+val_batch = create_batch(adj_normalized, features, labels, val_mask)
+test_batch = create_batch(adj_normalized, features, labels, test_mask)
 
 print("Batch format created successfully!")
 print(f"Train batch keys: {list(train_batch.keys())}")
